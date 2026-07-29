@@ -12,109 +12,133 @@ admin.initializeApp({
 const db = admin.database();
 
 
-// Extract product information from Telegram text
+// Extract identities from Telegram post
 function extractDetails(text) {
+
   const data = {
+    description: "",
+    name: "",
     category: "",
     brand: "",
     type: "",
     price: "",
     condition: "",
-    name: "",
-    secondary_storage: "",
-    description: "",
-    contact_phone: ""
+    processor: "",
+    display: "",
+    ram: "",
+    graphics: "",
+    battery_life: "",
+    life_features: "",
+    best_for: "",
+    telegram: "",
+    memory: ""
   };
+
+
+  const fields = {
+    "name": "name",
+    "category": "category",
+    "brand": "brand",
+    "type": "type",
+    "price": "price",
+    "condition": "condition",
+    "processor": "processor",
+    "display": "display",
+    "ram": "ram",
+    "graphics": "graphics",
+    "battery life": "battery_life",
+    "life features": "life_features",
+    "best for": "best_for",
+    "telegram": "telegram",
+    "memory": "memory"
+  };
+
 
   const lines = text.split("\n");
 
+  let foundFirstIdentity = false;
+  let descriptionLines = [];
+
+
   lines.forEach(line => {
-    const parts = line.split(":");
 
-    if (parts.length < 2) return;
+    const separator = line.indexOf(":");
 
-    const key = parts[0].trim().toLowerCase();
-    const value = parts.slice(1).join(":").trim();
 
-    switch (key) {
-      case "category":
-        data.category = value;
-        break;
+    if (separator !== -1) {
 
-      case "brand":
-        data.brand = value;
-        break;
+      const key = line.substring(0, separator)
+        .trim()
+        .toLowerCase();
 
-      case "type":
-        data.type = value;
-        break;
+      const value = line.substring(separator + 1)
+        .trim();
 
-      case "price":
-        data.price = value;
-        break;
 
-      case "condition":
-        data.condition = value;
-        break;
+      if (fields[key]) {
 
-      case "name":
-        data.name = value;
-        break;
+        foundFirstIdentity = true;
+        data[fields[key]] = value;
 
-      case "secondary storage":
-        data.secondary_storage = value;
-        break;
-
-      case "description":
-        data.description = value;
-        break;
-
-      case "contact phone":
-        data.contact_phone = value;
-        break;
+        return;
+      }
     }
+
+
+    // Before first identity = description
+    if (!foundFirstIdentity && line.trim()) {
+      descriptionLines.push(line.trim());
+    }
+
   });
+
+
+  data.description = descriptionLines.join("\n");
+
 
   return data;
 }
 
 
+
 app.post("/webhook", async (req, res) => {
+
   try {
+
     const update = req.body;
     const msg = update.channel_post;
+
 
     if (!msg) {
       return res.sendStatus(200);
     }
 
+
     const messageText = msg.text || msg.caption || "";
+
 
     const details = extractDetails(messageText);
 
+
     const post = {
+
       message_id: msg.message_id,
       chat_id: msg.chat.id,
       chat_title: msg.chat.title,
+
       text: messageText,
       date: msg.date,
 
-      // Product identities
-      category: details.category,
-      brand: details.brand,
-      type: details.type,
-      price: details.price,
-      condition: details.condition,
-      name: details.name,
-      secondary_storage: details.secondary_storage,
-      description: details.description,
-      contact_phone: details.contact_phone
+
+      ...details
+
     };
 
 
     if (msg.photo) {
       post.photo = msg.photo[msg.photo.length - 1].file_id;
     }
+
 
     if (msg.video) {
       post.video = msg.video.file_id;
@@ -123,20 +147,28 @@ app.post("/webhook", async (req, res) => {
 
     await db.ref("telegram_posts").push(post);
 
+
     console.log("Saved:", post);
+
 
     res.sendStatus(200);
 
+
   } catch (err) {
+
     console.error(err);
     res.sendStatus(500);
+
   }
+
 });
+
 
 
 app.get("/", (req, res) => {
   res.send("Telegram Firebase Sync Running");
 });
+
 
 
 const PORT = process.env.PORT || 3000;
