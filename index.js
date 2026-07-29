@@ -23,24 +23,39 @@ const db = admin.database();
 // --- Telegram Bot token (optional, needed for image URLs) ---
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
+// --- Simple in‑memory deduplication cache (optional) ---
+const processedIds = new Set();
+// Clear the cache every 10 seconds to avoid memory growth
+setInterval(() => processedIds.clear(), 10000);
+
 // ------------------------------------------------------------
 // Helper: strip emojis and markdown formatting from keys
 // ------------------------------------------------------------
 function cleanKey(str) {
-  // Remove emojis (common ranges)
   let cleaned = str.replace(/[\u{1F000}-\u{1FFFF}]/gu, "").trim();
-  // Remove markdown bold/italic markers
   cleaned = cleaned.replace(/\*\*/g, "").replace(/__/g, "").trim();
   return cleaned;
+}
+
+// ------------------------------------------------------------
+// Helper: extract numeric price (first number with optional commas/dots)
+// ------------------------------------------------------------
+function extractPrice(raw) {
+  // Match the first sequence of digits, commas, dots, and maybe a decimal point
+  const match = raw.match(/(\d+[\d,.]*\d+|\d+)/);
+  if (!match) return "";
+  // Remove commas (they are thousand separators) and convert to a clean number string
+  const numStr = match[1].replace(/,/g, "");
+  // If you want to keep decimals, parseFloat; otherwise keep as string
+  // We'll store as string to preserve format
+  return numStr;
 }
 
 // ------------------------------------------------------------
 // Get a downloadable URL for a Telegram file (photo/video)
 // ------------------------------------------------------------
 async function getTelegramFileUrl(fileId) {
-  if (!BOT_TOKEN) {
-    return null; // token not set, can't generate URL
-  }
+  if (!BOT_TOKEN) return null;
   try {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`;
     const response = await fetch(url);
@@ -61,7 +76,6 @@ async function getTelegramFileUrl(fileId) {
 // Extract structured data (with multiline support)
 // ------------------------------------------------------------
 function extractDetails(text) {
-  // Default empty fields
   const data = {
     description: "",
     name: "",
@@ -79,13 +93,12 @@ function extractDetails(text) {
     best_for: "",
     telegram: "",
     memory: "",
-    storage: "",      // we'll map to memory, but keep separate for clarity
+    storage: "",
     location: "",
     website: "",
     phone: "",
   };
 
-  // Mapping from (cleaned, lowercase) key to data property
   const fieldMap = {
     name: "name",
     category: "category",
@@ -102,7 +115,7 @@ function extractDetails(text) {
     "best for": "best_for",
     telegram: "telegram",
     memory: "memory",
-    storage: "storage",   // we'll later copy to memory if not set
+    storage: "storage",
     location: "location",
     website: "website",
     "call us": "phone",
@@ -112,17 +125,14 @@ function extractDetails(text) {
 
   const lines = text.split("\n");
   const descriptionLines = [];
-  let currentField = null;       // which data property we are filling
+  let currentField = null;
   let currentValue = [];
-
-  // Flag to know if we have encountered the first field (description stops before that)
   let foundFirstIdentity = false;
 
   for (const rawLine of lines) {
     const trimmed = rawLine.trim();
-    if (!trimmed) continue; // skip empty lines (but maybe we want to preserve them? Usually not)
+    if (!trimmed) continue;
 
-    // Try to detect a field: line contains ":"
     const separator = trimmed.indexOf(":");
     let isField = false;
     let key = null;
@@ -132,67 +142,51 @@ function extractDetails(text) {
       const rawKey = trimmed.substring(0, separator).trim();
       const cleaned = cleanKey(rawKey).toLowerCase();
       const possibleValue = trimmed.substring(separator + 1).trim();
-
-      // Check if cleaned key exists in our map
       if (fieldMap[cleaned]) {
         isField = true;
         key = fieldMap[cleaned];
-        value = possibleValue; // could be empty
+        value = possibleValue;
       }
     }
 
     if (isField) {
-      // We found a new field – save the previous one (if any)
       if (currentField) {
-        // Join multiline values
         data[currentField] = currentValue.join("\n").trim();
         currentValue = [];
       }
-
-      // Start new field
       currentField = key;
-      // If there is a non-empty value on the same line, start with it
-      if (value) {
-        currentValue.push(value);
-      }
-      // If value is empty, we leave currentValue empty, so subsequent lines become value.
-
-      // Mark that we have found at least one identity
-      if (!foundFirstIdentity) {
-        foundFirstIdentity = true;
-      }
+      if (value) currentValue.push(value);
+      if (!foundFirstIdentity) foundFirstIdentity = true;
     } else {
-      // Not a field line – it belongs to the current field (if any)
       if (currentField) {
-        // Append to current field's value
         currentValue.push(trimmed);
       } else {
-        // Before any field: it's part of the description
         descriptionLines.push(trimmed);
       }
     }
   }
 
-  // Flush the last field
   if (currentField) {
     data[currentField] = currentValue.join("\n").trim();
   }
 
-  // Set description
   data.description = descriptionLines.join("\n");
 
-  // If storage is set but memory isn't, copy storage to memory
+  // --- Special handling for price: extract only the numeric part ---
+  if (data.price) {
+    const numericPrice = extractPrice(data.price);
+    if (numericPrice) data.price = numericPrice;
+    // else keep as is (or clear?) – we'll keep empty if no number found
+  }
+
+  // Copy storage to memory if needed
   if (data.storage && !data.memory) {
     data.memory = data.storage;
   }
-  // If you want to remove storage to avoid duplication, uncomment:
-  // delete data.storage;
 
-  // Cleanup: trim all fields
-  for (const key of Object.keys(data)) {
-    if (typeof data[key] === "string") {
-      data[key] = data[key].trim();
-    }
+  // Trim all fields
+  for (const k of Object.keys(data)) {
+    if (typeof data[k] === "string") data[k] = data[k].trim();
   }
 
   return data;
@@ -211,46 +205,52 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
+    const messageId = msg.message_id;
+    const chatId = msg.chat.id;
+
+    // Optional: quick deduplication to prevent multiple simultaneous writes
+    const cacheKey = `${chatId}_${messageId}`;
+    if (processedIds.has(cacheKey)) {
+      console.log(`⏩ Skipping duplicate webhook for ${cacheKey}`);
+      return res.sendStatus(200);
+    }
+    processedIds.add(cacheKey);
+
     const messageText = msg.text || msg.caption || "";
     const details = extractDetails(messageText);
 
-    // Build the base post object
     const post = {
-      message_id: msg.message_id,
-      chat_id: msg.chat.id,
+      message_id: messageId,
+      chat_id: chatId,
       chat_title: msg.chat.title,
       text: messageText,
       date: msg.date,
       ...details,
     };
 
-    // --- Handle photos (generate URL) ---
+    // Handle photo
     if (msg.photo) {
       const largestPhoto = msg.photo[msg.photo.length - 1];
       post.photo_file_id = largestPhoto.file_id;
       if (BOT_TOKEN) {
         const url = await getTelegramFileUrl(largestPhoto.file_id);
-        if (url) {
-          post.photo_url = url;
-        }
+        if (url) post.photo_url = url;
       }
     }
 
-    // --- Handle videos (generate URL) ---
+    // Handle video
     if (msg.video) {
       post.video_file_id = msg.video.file_id;
       if (BOT_TOKEN) {
         const url = await getTelegramFileUrl(msg.video.file_id);
-        if (url) {
-          post.video_url = url;
-        }
+        if (url) post.video_url = url;
       }
     }
 
-    // Save to Firebase using message_id as the key (overwrites on edits)
-    await db.ref(`telegram_posts/${msg.message_id}`).set(post);
+    // Save to Firebase using message_id as the key – overwrites on edits, no duplicates
+    await db.ref(`telegram_posts/${messageId}`).set(post);
 
-    console.log(`✅ Saved post ${msg.message_id} from ${msg.chat.title}`);
+    console.log(`✅ Saved post ${messageId} from ${msg.chat.title}`);
     res.sendStatus(200);
   } catch (err) {
     console.error("❌ Webhook error:", err);
