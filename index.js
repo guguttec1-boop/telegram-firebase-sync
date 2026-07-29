@@ -1,5 +1,6 @@
 const express = require("express");
 const admin = require("firebase-admin");
+const crypto = require("crypto");   // built‑in
 
 // For Node < 18, install node-fetch. For Node 18+, you can remove this require.
 const fetch = require("node-fetch");
@@ -23,10 +24,9 @@ const db = admin.database();
 // --- Telegram Bot token (optional, needed for image URLs) ---
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
-// --- Simple in‑memory deduplication cache (optional) ---
-const processedIds = new Set();
-// Clear the cache every 10 seconds to avoid memory growth
-setInterval(() => processedIds.clear(), 10000);
+// --- In‑memory cache to reduce Firebase reads (expires after 1 minute) ---
+const recentlySeenHashes = new Set();
+setInterval(() => recentlySeenHashes.clear(), 60000);
 
 // ------------------------------------------------------------
 // Helper: strip emojis and markdown formatting from keys
@@ -41,14 +41,9 @@ function cleanKey(str) {
 // Helper: extract numeric price (first number with optional commas/dots)
 // ------------------------------------------------------------
 function extractPrice(raw) {
-  // Match the first sequence of digits, commas, dots, and maybe a decimal point
   const match = raw.match(/(\d+[\d,.]*\d+|\d+)/);
   if (!match) return "";
-  // Remove commas (they are thousand separators) and convert to a clean number string
-  const numStr = match[1].replace(/,/g, "");
-  // If you want to keep decimals, parseFloat; otherwise keep as string
-  // We'll store as string to preserve format
-  return numStr;
+  return match[1].replace(/,/g, ""); // keep as string
 }
 
 // ------------------------------------------------------------
@@ -172,14 +167,14 @@ function extractDetails(text) {
 
   data.description = descriptionLines.join("\n");
 
-  // --- Special handling for price: extract only the numeric part ---
+  // Price extraction
   if (data.price) {
-    const numericPrice = extractPrice(data.price);
-    if (numericPrice) data.price = numericPrice;
-    // else keep as is (or clear?) – we'll keep empty if no number found
+    const numeric = extractPrice(data.price);
+    if (numeric) data.price = numeric;
+    else data.price = "";
   }
 
-  // Copy storage to memory if needed
+  // Storage → memory fallback
   if (data.storage && !data.memory) {
     data.memory = data.storage;
   }
@@ -190,6 +185,14 @@ function extractDetails(text) {
   }
 
   return data;
+}
+
+// ------------------------------------------------------------
+// Compute a content hash for deduplication
+// ------------------------------------------------------------
+function computeContentHash(text, photoFileId, videoFileId) {
+  const payload = [text || "", photoFileId || "", videoFileId || ""].join("|");
+  return crypto.createHash("sha256").update(payload).digest("hex");
 }
 
 // ------------------------------------------------------------
@@ -205,18 +208,45 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    const messageId = msg.message_id;
+    const messageText = msg.text || msg.caption || "";
     const chatId = msg.chat.id;
+    const messageId = msg.message_id;
 
-    // Optional: quick deduplication to prevent multiple simultaneous writes
-    const cacheKey = `${chatId}_${messageId}`;
-    if (processedIds.has(cacheKey)) {
-      console.log(`⏩ Skipping duplicate webhook for ${cacheKey}`);
+    // --- Extract media file IDs (if any) ---
+    let photoFileId = null;
+    let videoFileId = null;
+    if (msg.photo) {
+      photoFileId = msg.photo[msg.photo.length - 1].file_id;
+    }
+    if (msg.video) {
+      videoFileId = msg.video.file_id;
+    }
+
+    // --- 1) Quick in‑memory check based on message_id (prevents immediate retries) ---
+    const shortCacheKey = `${chatId}_${messageId}`;
+    // (We'll use a separate Set for message_id; not necessary for content dedup, but nice to have)
+    // I'll keep the previous cache but we can combine.
+
+    // --- 2) Content‑based deduplication ---
+    const contentHash = computeContentHash(messageText, photoFileId, videoFileId);
+
+    // Check in‑memory cache first
+    if (recentlySeenHashes.has(contentHash)) {
+      console.log(`⏩ Skipping duplicate content (hash ${contentHash.slice(0,8)})`);
       return res.sendStatus(200);
     }
-    processedIds.add(cacheKey);
 
-    const messageText = msg.text || msg.caption || "";
+    // Then check Firebase
+    const hashRef = db.ref(`processed_hashes/${contentHash}`);
+    const snapshot = await hashRef.once("value");
+    if (snapshot.exists()) {
+      console.log(`⏩ Content already processed (hash ${contentHash.slice(0,8)}) – skipping`);
+      // Add to memory cache to avoid repeated checks
+      recentlySeenHashes.add(contentHash);
+      return res.sendStatus(200);
+    }
+
+    // --- Not seen before – proceed with saving ---
     const details = extractDetails(messageText);
 
     const post = {
@@ -228,29 +258,36 @@ app.post("/webhook", async (req, res) => {
       ...details,
     };
 
-    // Handle photo
-    if (msg.photo) {
-      const largestPhoto = msg.photo[msg.photo.length - 1];
-      post.photo_file_id = largestPhoto.file_id;
+    // Attach photo/video info
+    if (photoFileId) {
+      post.photo_file_id = photoFileId;
       if (BOT_TOKEN) {
-        const url = await getTelegramFileUrl(largestPhoto.file_id);
+        const url = await getTelegramFileUrl(photoFileId);
         if (url) post.photo_url = url;
       }
     }
-
-    // Handle video
-    if (msg.video) {
-      post.video_file_id = msg.video.file_id;
+    if (videoFileId) {
+      post.video_file_id = videoFileId;
       if (BOT_TOKEN) {
-        const url = await getTelegramFileUrl(msg.video.file_id);
+        const url = await getTelegramFileUrl(videoFileId);
         if (url) post.video_url = url;
       }
     }
 
-    // Save to Firebase using message_id as the key – overwrites on edits, no duplicates
+    // Save to Firebase under telegram_posts (with message_id as key)
     await db.ref(`telegram_posts/${messageId}`).set(post);
 
-    console.log(`✅ Saved post ${messageId} from ${msg.chat.title}`);
+    // Mark hash as processed
+    await hashRef.set({
+      first_seen: admin.database.ServerValue.TIMESTAMP,
+      message_id: messageId,
+      chat_id: chatId,
+    });
+
+    // Add to in‑memory cache
+    recentlySeenHashes.add(contentHash);
+
+    console.log(`✅ Saved new post ${messageId} (hash ${contentHash.slice(0,8)})`);
     res.sendStatus(200);
   } catch (err) {
     console.error("❌ Webhook error:", err);
