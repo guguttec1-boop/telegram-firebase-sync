@@ -1,35 +1,40 @@
 const express = require("express");
 const admin = require("firebase-admin");
-const crypto = require("crypto");   // built‑in
+const crypto = require("crypto");
 
-// For Node < 18, install node-fetch. For Node 18+, you can remove this require.
+// For Node < 18, install node-fetch; for Node 18+, remove this require.
 const fetch = require("node-fetch");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// --- Validate environment variables ---
+// Validate environment variables
 if (!process.env.FIREBASE_KEY || !process.env.FIREBASE_URL) {
   console.error("Missing FIREBASE_KEY or FIREBASE_URL");
   process.exit(1);
 }
 
-// --- Initialize Firebase ---
+// Initialize Firebase
 admin.initializeApp({
   credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_KEY)),
   databaseURL: process.env.FIREBASE_URL,
 });
 const db = admin.database();
 
-// --- Telegram Bot token (optional, needed for image URLs) ---
+// Telegram Bot token (required for file URLs)
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-console.log("TOKEN FOUND:", !!BOT_TOKEN);
-// --- In‑memory cache to reduce Firebase reads (expires after 1 minute) ---
+if (!BOT_TOKEN) {
+  console.warn("⚠️ TELEGRAM_BOT_TOKEN not set – file URLs will NOT be generated.");
+} else {
+  console.log("✅ TELEGRAM_BOT_TOKEN is set.");
+}
+
+// In‑memory dedup cache
 const recentlySeenHashes = new Set();
 setInterval(() => recentlySeenHashes.clear(), 60000);
 
 // ------------------------------------------------------------
-// Helper: strip emojis and markdown formatting from keys
+// Helpers (cleanKey, extractPrice, etc.)
 // ------------------------------------------------------------
 function cleanKey(str) {
   let cleaned = str.replace(/[\u{1F000}-\u{1FFFF}]/gu, "").trim();
@@ -37,85 +42,68 @@ function cleanKey(str) {
   return cleaned;
 }
 
-// ------------------------------------------------------------
-// Helper: extract numeric price (first number with optional commas/dots)
-// ------------------------------------------------------------
 function extractPrice(raw) {
   const match = raw.match(/(\d+[\d,.]*\d+|\d+)/);
   if (!match) return "";
-  return match[1].replace(/,/g, ""); // keep as string
+  return match[1].replace(/,/g, "");
 }
 
 // ------------------------------------------------------------
-// Get a downloadable URL for a Telegram file (photo/video)
+// Get downloadable URL for a Telegram file (with logging)
 // ------------------------------------------------------------
 async function getTelegramFileUrl(fileId) {
-  if (!BOT_TOKEN) return null;
+  if (!BOT_TOKEN) {
+    console.log("⏩ getTelegramFileUrl: BOT_TOKEN missing, returning null");
+    return null;
+  }
+
   try {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`;
+    console.log(`🔍 Fetching file URL for file_id: ${fileId}`);
     const response = await fetch(url);
     const data = await response.json();
+
     if (!data.ok) {
-      console.error("Telegram getFile error:", data.description);
+      console.error(`❌ Telegram API error for getFile: ${data.description}`);
       return null;
     }
+
+    if (!data.result || !data.result.file_path) {
+      console.error("❌ No file_path in Telegram response:", data);
+      return null;
+    }
+
     const filePath = data.result.file_path;
-    return `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+    const fullUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+    console.log(`✅ Generated file URL: ${fullUrl}`);
+    return fullUrl;
   } catch (err) {
-    console.error("Failed to get file URL:", err.message);
+    console.error(`❌ Exception in getTelegramFileUrl: ${err.message}`);
     return null;
   }
 }
 
 // ------------------------------------------------------------
-// Extract structured data (with multiline support)
+// Extract structured data
 // ------------------------------------------------------------
 function extractDetails(text) {
+  // ... (same as before) ...
   const data = {
     description: "",
-    name: "",
-    category: "",
-    brand: "",
-    type: "",
-    price: "",
-    condition: "",
-    processor: "",
-    display: "",
-    ram: "",
-    graphics: "",
-    battery_life: "",
-    life_features: "",
-    best_for: "",
-    telegram: "",
-    memory: "",
-    storage: "",
-    location: "",
-    website: "",
-    phone: "",
+    name: "", category: "", brand: "", type: "", price: "", condition: "",
+    processor: "", display: "", ram: "", graphics: "", battery_life: "",
+    life_features: "", best_for: "", telegram: "", memory: "", storage: "",
+    location: "", website: "", phone: "",
   };
 
   const fieldMap = {
-    name: "name",
-    category: "category",
-    brand: "brand",
-    type: "type",
-    price: "price",
-    condition: "condition",
-    processor: "processor",
-    display: "display",
-    ram: "ram",
-    graphics: "graphics",
-    "battery life": "battery_life",
-    "life features": "life_features",
-    "best for": "best_for",
-    telegram: "telegram",
-    memory: "memory",
-    storage: "storage",
-    location: "location",
-    website: "website",
-    "call us": "phone",
-    phone: "phone",
-    contact: "phone",
+    name: "name", category: "category", brand: "brand", type: "type",
+    price: "price", condition: "condition", processor: "processor",
+    display: "display", ram: "ram", graphics: "graphics",
+    "battery life": "battery_life", "life features": "life_features",
+    "best for": "best_for", telegram: "telegram", memory: "memory",
+    storage: "storage", location: "location", website: "website",
+    "call us": "phone", phone: "phone", contact: "phone",
   };
 
   const lines = text.split("\n");
@@ -179,7 +167,6 @@ function extractDetails(text) {
     data.memory = data.storage;
   }
 
-  // Trim all fields
   for (const k of Object.keys(data)) {
     if (typeof data[k] === "string") data[k] = data[k].trim();
   }
@@ -188,7 +175,7 @@ function extractDetails(text) {
 }
 
 // ------------------------------------------------------------
-// Compute a content hash for deduplication
+// Content hash
 // ------------------------------------------------------------
 function computeContentHash(text, photoFileId, videoFileId) {
   const payload = [text || "", photoFileId || "", videoFileId || ""].join("|");
@@ -210,7 +197,7 @@ app.post("/webhook", async (req, res) => {
 
     const messageText = msg.text || msg.caption || "";
 
-    // --- NEW: Skip if there is no text content ---
+    // Skip empty text
     if (!messageText) {
       console.log("⏩ Skipping: empty text/caption");
       return res.sendStatus(200);
@@ -219,26 +206,26 @@ app.post("/webhook", async (req, res) => {
     const chatId = msg.chat.id;
     const messageId = msg.message_id;
 
-    // --- Extract media file IDs (if any) ---
+    // --- Extract media file IDs ---
     let photoFileId = null;
     let videoFileId = null;
     if (msg.photo) {
       photoFileId = msg.photo[msg.photo.length - 1].file_id;
+      console.log(`📸 Photo file_id: ${photoFileId}`);
     }
     if (msg.video) {
       videoFileId = msg.video.file_id;
+      console.log(`🎬 Video file_id: ${videoFileId}`);
     }
 
-    // --- Content‑based deduplication ---
+    // --- Content deduplication ---
     const contentHash = computeContentHash(messageText, photoFileId, videoFileId);
 
-    // Check in‑memory cache first
     if (recentlySeenHashes.has(contentHash)) {
       console.log(`⏩ Skipping duplicate content (hash ${contentHash.slice(0,8)})`);
       return res.sendStatus(200);
     }
 
-    // Then check Firebase
     const hashRef = db.ref(`processed_hashes/${contentHash}`);
     const snapshot = await hashRef.once("value");
     if (snapshot.exists()) {
@@ -247,7 +234,7 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // --- Not seen before – proceed with saving ---
+    // --- Parse the text ---
     const details = extractDetails(messageText);
 
     const post = {
@@ -259,23 +246,38 @@ app.post("/webhook", async (req, res) => {
       ...details,
     };
 
-    // Attach photo/video info
+    // --- Attach photo/video info (including URL) ---
     if (photoFileId) {
       post.photo_file_id = photoFileId;
       if (BOT_TOKEN) {
         const url = await getTelegramFileUrl(photoFileId);
-        if (url) post.photo_url = url;
+        if (url) {
+          post.photo_url = url;
+          console.log(`✅ Added photo_url: ${url}`);
+        } else {
+          console.warn(`⚠️ Could not generate photo URL for file_id: ${photoFileId}`);
+        }
+      } else {
+        console.warn("⚠️ BOT_TOKEN missing – skipping photo URL generation.");
       }
     }
+
     if (videoFileId) {
       post.video_file_id = videoFileId;
       if (BOT_TOKEN) {
         const url = await getTelegramFileUrl(videoFileId);
-        if (url) post.video_url = url;
+        if (url) {
+          post.video_url = url;
+          console.log(`✅ Added video_url: ${url}`);
+        } else {
+          console.warn(`⚠️ Could not generate video URL for file_id: ${videoFileId}`);
+        }
+      } else {
+        console.warn("⚠️ BOT_TOKEN missing – skipping video URL generation.");
       }
     }
 
-    // Save to Firebase under telegram_posts (with message_id as key)
+    // --- Save to Firebase ---
     await db.ref(`telegram_posts/${messageId}`).set(post);
 
     // Mark hash as processed
@@ -285,7 +287,6 @@ app.post("/webhook", async (req, res) => {
       chat_id: chatId,
     });
 
-    // Add to in‑memory cache
     recentlySeenHashes.add(contentHash);
 
     console.log(`✅ Saved new post ${messageId} (hash ${contentHash.slice(0,8)})`);
