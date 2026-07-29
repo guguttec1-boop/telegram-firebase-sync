@@ -1,36 +1,68 @@
 const express = require("express");
 const admin = require("firebase-admin");
 
+// For making HTTP requests to Telegram API
+const fetch = require("node-fetch"); // if Node < 18, install via npm
+// If using Node 18+, you can use global fetch and remove this require.
+
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// Validate required environment variables
+// --- Validate environment variables ---
 if (!process.env.FIREBASE_KEY || !process.env.FIREBASE_URL) {
   console.error("Missing FIREBASE_KEY or FIREBASE_URL");
   process.exit(1);
 }
 
-// Initialize Firebase Admin SDK
+// --- Initialize Firebase ---
 admin.initializeApp({
   credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_KEY)),
   databaseURL: process.env.FIREBASE_URL,
 });
-
 const db = admin.database();
 
+// --- Telegram Bot token (optional) ---
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
 // ------------------------------------------------------------
-// Helper: remove common emoji characters from a string
+// Helper: strip emojis and markdown formatting
 // ------------------------------------------------------------
-function stripEmojis(str) {
-  // Covers most emojis (including symbols, flags, etc.)
-  return str.replace(/[\u{1F000}-\u{1FFFF}]/gu, "").trim();
+function cleanKey(str) {
+  // Remove emojis (common ranges)
+  let cleaned = str.replace(/[\u{1F000}-\u{1FFFF}]/gu, "").trim();
+  // Remove markdown bold/italic markers
+  cleaned = cleaned.replace(/\*\*/g, "").replace(/__/g, "").trim();
+  return cleaned;
 }
 
 // ------------------------------------------------------------
-// Extract structured data from Telegram message text
+// Get a downloadable URL for a Telegram file (photo/video)
+// ------------------------------------------------------------
+async function getTelegramFileUrl(fileId) {
+  if (!BOT_TOKEN) {
+    return null; // token not set, can't generate URL
+  }
+  try {
+    const url = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`;
+    const response = await fetch(url);
+    const data = await response.json();
+    if (!data.ok) {
+      console.error("Telegram getFile error:", data.description);
+      return null;
+    }
+    const filePath = data.result.file_path;
+    return `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+  } catch (err) {
+    console.error("Failed to get file URL:", err.message);
+    return null;
+  }
+}
+
+// ------------------------------------------------------------
+// Extract structured data (with multiline support)
 // ------------------------------------------------------------
 function extractDetails(text) {
-  // Default empty object
+  // Default empty fields
   const data = {
     description: "",
     name: "",
@@ -48,10 +80,14 @@ function extractDetails(text) {
     best_for: "",
     telegram: "",
     memory: "",
+    storage: "",      // we'll map to memory, but keep separate for clarity
+    location: "",
+    website: "",
+    phone: "",
   };
 
-  // Mapping from (lowercase, stripped) key to data property
-  const fields = {
+  // Mapping from (cleaned, lowercase) key to data property
+  const fieldMap = {
     name: "name",
     category: "category",
     brand: "brand",
@@ -67,45 +103,99 @@ function extractDetails(text) {
     "best for": "best_for",
     telegram: "telegram",
     memory: "memory",
-    storage: "memory", // added to handle "Storage:" lines
+    storage: "storage",   // we'll later copy to memory if not set
+    location: "location",
+    website: "website",
+    "call us": "phone",
+    phone: "phone",
+    contact: "phone",
   };
 
   const lines = text.split("\n");
-  let foundFirstIdentity = false;
   const descriptionLines = [];
+  let currentField = null;       // which data property we are filling
+  let currentValue = [];
 
-  for (const line of lines) {
-    const trimmed = line.trim();
+  // We'll collect all lines until we detect a known field.
+  // The first known field marks the end of description.
+  let foundFirstIdentity = false;
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
     if (!trimmed) continue;
 
+    // Try to detect a field: line contains ":"
     const separator = trimmed.indexOf(":");
-    if (separator !== -1) {
-      // Extract key and value
-      const rawKey = trimmed.substring(0, separator).trim();
-      const key = stripEmojis(rawKey).toLowerCase();
-      const value = trimmed.substring(separator + 1).trim();
+    let isField = false;
+    let key = null;
+    let value = "";
 
-      // If this is a known field, store it
-      if (fields[key]) {
-        foundFirstIdentity = true;
-        data[fields[key]] = value;
-        continue;
+    if (separator !== -1) {
+      const rawKey = trimmed.substring(0, separator).trim();
+      const cleaned = cleanKey(rawKey).toLowerCase();
+      const possibleValue = trimmed.substring(separator + 1).trim();
+
+      // Check if cleaned key exists in our map
+      if (fieldMap[cleaned]) {
+        isField = true;
+        key = fieldMap[cleaned];
+        value = possibleValue;
       }
     }
 
-    // If we haven't seen any known field yet, treat this line as description.
-    // Optionally, you could also keep non‑matched lines after the first field
-    // by removing the `if (!foundFirstIdentity)` condition.
-    if (!foundFirstIdentity) {
-      descriptionLines.push(trimmed);
+    if (isField) {
+      // We found a new field – save the previous one (if any)
+      if (currentField) {
+        // Join multiline values
+        data[currentField] = currentValue.join("\n").trim();
+        currentValue = [];
+      }
+
+      // Start new field
+      currentField = key;
+      // If there is a value on the same line, start with it
+      if (value) {
+        currentValue.push(value);
+      }
+
+      // Mark that we have found at least one identity
+      if (!foundFirstIdentity) {
+        foundFirstIdentity = true;
+      }
+    } else {
+      // Not a field line – it belongs to the current field (if any)
+      if (currentField) {
+        // Append to current field's value
+        currentValue.push(trimmed);
+      } else {
+        // Before any field: it's part of the description
+        descriptionLines.push(trimmed);
+      }
     }
-    // If you want to keep *all* non‑matched lines in description, uncomment:
-    // else {
-    //   descriptionLines.push(trimmed);
-    // }
   }
 
+  // Flush the last field
+  if (currentField) {
+    data[currentField] = currentValue.join("\n").trim();
+  }
+
+  // Set description
   data.description = descriptionLines.join("\n");
+
+  // If storage is set but memory isn't, copy storage to memory
+  if (data.storage && !data.memory) {
+    data.memory = data.storage;
+  }
+  // Remove storage from final object? We can keep it, but if you want to avoid duplicates, delete it.
+  // delete data.storage; // optional
+
+  // Cleanup: trim all fields
+  for (const key of Object.keys(data)) {
+    if (typeof data[key] === "string") {
+      data[key] = data[key].trim();
+    }
+  }
+
   return data;
 }
 
@@ -118,7 +208,6 @@ app.post("/webhook", async (req, res) => {
     const msg = update.channel_post;
 
     if (!msg) {
-      // Not a channel post – ignore (but log for debugging)
       console.log("Ignored update type:", Object.keys(update));
       return res.sendStatus(200);
     }
@@ -126,7 +215,7 @@ app.post("/webhook", async (req, res) => {
     const messageText = msg.text || msg.caption || "";
     const details = extractDetails(messageText);
 
-    // Build the post object
+    // Build the base post object
     const post = {
       message_id: msg.message_id,
       chat_id: msg.chat.id,
@@ -136,21 +225,36 @@ app.post("/webhook", async (req, res) => {
       ...details,
     };
 
-    // Attach photo/video if present
+    // --- Handle photos (generate URL) ---
     if (msg.photo) {
-      post.photo = msg.photo[msg.photo.length - 1].file_id;
-    }
-    if (msg.video) {
-      post.video = msg.video.file_id;
+      const largestPhoto = msg.photo[msg.photo.length - 1];
+      post.photo_file_id = largestPhoto.file_id;
+      if (BOT_TOKEN) {
+        const url = await getTelegramFileUrl(largestPhoto.file_id);
+        if (url) {
+          post.photo_url = url;
+        }
+      }
     }
 
-    // Use message_id as the key – this overwrites on edits, keeping only the latest version
+    // --- Handle videos (generate URL) ---
+    if (msg.video) {
+      post.video_file_id = msg.video.file_id;
+      if (BOT_TOKEN) {
+        const url = await getTelegramFileUrl(msg.video.file_id);
+        if (url) {
+          post.video_url = url;
+        }
+      }
+    }
+
+    // Save to Firebase using message_id as the key (overwrites on edits)
     await db.ref(`telegram_posts/${msg.message_id}`).set(post);
 
-    console.log(`Saved post ${msg.message_id} from chat ${msg.chat.title}`);
+    console.log(`✅ Saved post ${msg.message_id} from ${msg.chat.title}`);
     res.sendStatus(200);
   } catch (err) {
-    console.error("Webhook error:", err);
+    console.error("❌ Webhook error:", err);
     res.sendStatus(500);
   }
 });
@@ -159,7 +263,7 @@ app.post("/webhook", async (req, res) => {
 // Health check
 // ------------------------------------------------------------
 app.get("/", (req, res) => {
-  res.send("Telegram Firebase Sync Running");
+  res.send("Telegram Firebase Sync Running ✅");
 });
 
 // ------------------------------------------------------------
@@ -167,5 +271,5 @@ app.get("/", (req, res) => {
 // ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server started on port ${PORT}`);
+  console.log(`🚀 Server started on port ${PORT}`);
 });
