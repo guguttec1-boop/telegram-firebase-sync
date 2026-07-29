@@ -23,7 +23,7 @@ const db = admin.database();
 
 // --- Telegram Bot token (optional, needed for image URLs) ---
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-
+console.log("TOKEN FOUND:", !!BOT_TOKEN);
 // --- In‑memory cache to reduce Firebase reads (expires after 1 minute) ---
 const recentlySeenHashes = new Set();
 setInterval(() => recentlySeenHashes.clear(), 60000);
