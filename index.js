@@ -1,9 +1,8 @@
 const express = require("express");
 const admin = require("firebase-admin");
 
-// For making HTTP requests to Telegram API
-const fetch = require("node-fetch"); // if Node < 18, install via npm
-// If using Node 18+, you can use global fetch and remove this require.
+// For Node < 18, install node-fetch. For Node 18+, you can remove this require.
+const fetch = require("node-fetch");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -21,11 +20,11 @@ admin.initializeApp({
 });
 const db = admin.database();
 
-// --- Telegram Bot token (optional) ---
+// --- Telegram Bot token (optional, needed for image URLs) ---
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 // ------------------------------------------------------------
-// Helper: strip emojis and markdown formatting
+// Helper: strip emojis and markdown formatting from keys
 // ------------------------------------------------------------
 function cleanKey(str) {
   // Remove emojis (common ranges)
@@ -116,13 +115,12 @@ function extractDetails(text) {
   let currentField = null;       // which data property we are filling
   let currentValue = [];
 
-  // We'll collect all lines until we detect a known field.
-  // The first known field marks the end of description.
+  // Flag to know if we have encountered the first field (description stops before that)
   let foundFirstIdentity = false;
 
   for (const rawLine of lines) {
     const trimmed = rawLine.trim();
-    if (!trimmed) continue;
+    if (!trimmed) continue; // skip empty lines (but maybe we want to preserve them? Usually not)
 
     // Try to detect a field: line contains ":"
     const separator = trimmed.indexOf(":");
@@ -139,7 +137,7 @@ function extractDetails(text) {
       if (fieldMap[cleaned]) {
         isField = true;
         key = fieldMap[cleaned];
-        value = possibleValue;
+        value = possibleValue; // could be empty
       }
     }
 
@@ -153,10 +151,11 @@ function extractDetails(text) {
 
       // Start new field
       currentField = key;
-      // If there is a value on the same line, start with it
+      // If there is a non-empty value on the same line, start with it
       if (value) {
         currentValue.push(value);
       }
+      // If value is empty, we leave currentValue empty, so subsequent lines become value.
 
       // Mark that we have found at least one identity
       if (!foundFirstIdentity) {
@@ -186,8 +185,8 @@ function extractDetails(text) {
   if (data.storage && !data.memory) {
     data.memory = data.storage;
   }
-  // Remove storage from final object? We can keep it, but if you want to avoid duplicates, delete it.
-  // delete data.storage; // optional
+  // If you want to remove storage to avoid duplication, uncomment:
+  // delete data.storage;
 
   // Cleanup: trim all fields
   for (const key of Object.keys(data)) {
