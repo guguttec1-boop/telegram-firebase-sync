@@ -209,6 +209,13 @@ app.post("/webhook", async (req, res) => {
     }
 
     const messageText = msg.text || msg.caption || "";
+
+    // --- NEW: Skip if there is no text content ---
+    if (!messageText) {
+      console.log("⏩ Skipping: empty text/caption");
+      return res.sendStatus(200);
+    }
+
     const chatId = msg.chat.id;
     const messageId = msg.message_id;
 
@@ -222,12 +229,7 @@ app.post("/webhook", async (req, res) => {
       videoFileId = msg.video.file_id;
     }
 
-    // --- 1) Quick in‑memory check based on message_id (prevents immediate retries) ---
-    const shortCacheKey = `${chatId}_${messageId}`;
-    // (We'll use a separate Set for message_id; not necessary for content dedup, but nice to have)
-    // I'll keep the previous cache but we can combine.
-
-    // --- 2) Content‑based deduplication ---
+    // --- Content‑based deduplication ---
     const contentHash = computeContentHash(messageText, photoFileId, videoFileId);
 
     // Check in‑memory cache first
@@ -241,7 +243,6 @@ app.post("/webhook", async (req, res) => {
     const snapshot = await hashRef.once("value");
     if (snapshot.exists()) {
       console.log(`⏩ Content already processed (hash ${contentHash.slice(0,8)}) – skipping`);
-      // Add to memory cache to avoid repeated checks
       recentlySeenHashes.add(contentHash);
       return res.sendStatus(200);
     }
