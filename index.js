@@ -162,13 +162,13 @@ function extractDetails(text) {
   return data;
 }
 
-function computeContentHash(text, photoFileIds) {
-  const payload = [text || "", ...(photoFileIds || [])].join("|");
+function computeContentHash(text, photoFileIds, videoFileIds) {
+  const payload = [text || "", ...(photoFileIds || []), ...(videoFileIds || [])].join("|");
   return crypto.createHash("sha256").update(payload).digest("hex");
 }
 
 // ------------------------------------------------------------
-// Process an album (group of photos)
+// Process an album (photos and/or videos)
 // ------------------------------------------------------------
 async function processAlbum(mediaGroupId, messages) {
   console.log(`🔄 Processing album ${mediaGroupId} with ${messages.length} messages...`);
@@ -187,39 +187,67 @@ async function processAlbum(mediaGroupId, messages) {
 
     console.log(`📸 Album ${mediaGroupId}: BOT_TOKEN present? ${!!BOT_TOKEN}`);
 
+    // Arrays for photos and videos
     const photoFileIds = [];
     const photoUrls = [];
+    const videoFileIds = [];
+    const videoUrls = [];
+
     for (const msg of sorted) {
+      // Photos
       if (msg.photo) {
         const largest = msg.photo[msg.photo.length - 1];
         const fileId = largest.file_id;
         photoFileIds.push(fileId);
-        console.log(`🔍 Processing photo with file_id: ${fileId}`);
+        console.log(`🖼️ Processing photo with file_id: ${fileId}`);
         if (BOT_TOKEN) {
           const url = await getTelegramFileUrl(fileId);
           if (url) {
             photoUrls.push(url);
-            console.log(`✅ Got URL: ${url}`);
+            console.log(`✅ Got photo URL: ${url}`);
           } else {
-            console.warn(`⚠️ No URL for file_id: ${fileId}`);
+            console.warn(`⚠️ No photo URL for file_id: ${fileId}`);
           }
         } else {
-          console.warn(`⏩ BOT_TOKEN missing – skipping URL generation for ${fileId}`);
+          console.warn(`⏩ BOT_TOKEN missing – skipping photo URL for ${fileId}`);
+        }
+      }
+
+      // Videos
+      if (msg.video) {
+        const fileId = msg.video.file_id;
+        videoFileIds.push(fileId);
+        console.log(`🎬 Processing video with file_id: ${fileId}`);
+        if (BOT_TOKEN) {
+          const url = await getTelegramFileUrl(fileId);
+          if (url) {
+            videoUrls.push(url);
+            console.log(`✅ Got video URL: ${url}`);
+          } else {
+            console.warn(`⚠️ No video URL for file_id: ${fileId}`);
+          }
+        } else {
+          console.warn(`⏩ BOT_TOKEN missing – skipping video URL for ${fileId}`);
         }
       }
     }
 
-    console.log(`📸 Album ${mediaGroupId}: found ${photoFileIds.length} photos, URLs: ${photoUrls.length}`);
+    console.log(`📸 Album ${mediaGroupId}: found ${photoFileIds.length} photos, ${videoFileIds.length} videos`);
 
+    // Parse structured fields from the caption
     const details = caption ? extractDetails(caption) : {};
+
+    // Build the post object
     const post = {
       chat_id: firstMsg.chat.id,
       chat_title: firstMsg.chat.title,
       date: firstMsg.date,
       text: caption,
       media_group_id: mediaGroupId,
-      photo_file_ids: photoFileIds,
-      photo_urls: photoUrls,
+      ...(photoFileIds.length > 0 && { photo_file_ids: photoFileIds }),
+      ...(photoUrls.length > 0 && { photo_urls: photoUrls }),
+      ...(videoFileIds.length > 0 && { video_file_ids: videoFileIds }),
+      ...(videoUrls.length > 0 && { video_urls: videoUrls }),
       ...details,
     };
 
@@ -227,15 +255,15 @@ async function processAlbum(mediaGroupId, messages) {
     const key = `album_${mediaGroupId}`;
     await db.ref(`telegram_posts/${key}`).set(post);
 
-    // Deduplicate
-    const hash = computeContentHash(caption, photoFileIds);
+    // Deduplicate – hash includes both photos and videos
+    const hash = computeContentHash(caption, photoFileIds, videoFileIds);
     await db.ref(`processed_hashes/${hash}`).set({
       first_seen: admin.database.ServerValue.TIMESTAMP,
       media_group_id: mediaGroupId,
       chat_id: firstMsg.chat.id,
     });
 
-    console.log(`✅ Saved album ${mediaGroupId} with ${photoFileIds.length} photos and ${photoUrls.length} URLs`);
+    console.log(`✅ Saved album ${mediaGroupId} with ${photoFileIds.length} photos and ${videoFileIds.length} videos`);
   } catch (err) {
     console.error(`❌ Error processing album ${mediaGroupId}:`, err);
   }
@@ -262,11 +290,12 @@ async function processSingleMessage(msg) {
       ...details,
     };
 
+    // Handle single photo
     if (msg.photo) {
       const largest = msg.photo[msg.photo.length - 1];
       const fileId = largest.file_id;
       post.photo_file_id = fileId;
-      console.log(`📸 Single photo file_id: ${fileId}`);
+      console.log(`🖼️ Single photo file_id: ${fileId}`);
       if (BOT_TOKEN) {
         const url = await getTelegramFileUrl(fileId);
         if (url) {
@@ -280,6 +309,7 @@ async function processSingleMessage(msg) {
       }
     }
 
+    // Handle single video
     if (msg.video) {
       const fileId = msg.video.file_id;
       post.video_file_id = fileId;
@@ -316,7 +346,7 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // If there is a media_group_id, buffer it
+    // If there is a media_group_id, buffer it (album)
     if (msg.media_group_id) {
       const groupId = msg.media_group_id;
       if (!pendingAlbums.has(groupId)) {
@@ -328,12 +358,11 @@ app.post("/webhook", async (req, res) => {
       // Clear existing timer
       if (entry.timer) clearTimeout(entry.timer);
 
-      // Set a new timer to process after 3 seconds (give time for all photos)
+      // Set a new timer to process after 3 seconds
       entry.timer = setTimeout(() => {
         console.log(`⏰ Timer fired for album ${groupId}`);
         const albumData = pendingAlbums.get(groupId);
         if (albumData) {
-          // Process album
           processAlbum(groupId, albumData.messages).then(() => {
             pendingAlbums.delete(groupId);
             console.log(`🧹 Album ${groupId} removed from buffer`);
@@ -345,7 +374,7 @@ app.post("/webhook", async (req, res) => {
         }
       }, 3000);
 
-      console.log(`📸 Buffering album ${groupId} (${entry.messages.length} photos so far)`);
+      console.log(`📸 Buffering album ${groupId} (${entry.messages.length} messages so far)`);
       return res.sendStatus(200);
     }
 
