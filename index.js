@@ -8,28 +8,26 @@ const fetch = require("node-fetch");
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// Validate environment variables
+// Validate environment
 if (!process.env.FIREBASE_KEY || !process.env.FIREBASE_URL) {
   console.error("Missing FIREBASE_KEY or FIREBASE_URL");
   process.exit(1);
 }
 
-// Initialize Firebase
 admin.initializeApp({
   credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_KEY)),
   databaseURL: process.env.FIREBASE_URL,
 });
 const db = admin.database();
 
-// Telegram Bot token (required for file URLs)
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!BOT_TOKEN) console.warn("⚠️ TELEGRAM_BOT_TOKEN not set – file URLs will NOT be generated.");
 
-// --- Album grouping (buffer) ---
-const pendingAlbums = new Map(); // key: media_group_id, value: { messages: [], timer }
+// --- Album buffer ---
+const pendingAlbums = new Map();
 
 // ------------------------------------------------------------
-// Helpers
+// Helper: clean keys, extract price, get file URL
 // ------------------------------------------------------------
 function cleanKey(str) {
   let cleaned = str.replace(/[\u{1F000}-\u{1FFFF}]/gu, "").trim();
@@ -61,6 +59,9 @@ async function getTelegramFileUrl(fileId) {
   }
 }
 
+// ------------------------------------------------------------
+// Extract structured fields from text
+// ------------------------------------------------------------
 function extractDetails(text) {
   const data = {
     description: "", name: "", category: "", brand: "", type: "",
@@ -130,21 +131,22 @@ function extractDetails(text) {
   return data;
 }
 
-function computeContentHash(text, photoFileIds, videoFileIds) {
-  const payload = [text || "", ...(photoFileIds || []), ...(videoFileIds || [])].join("|");
+function computeContentHash(text, photoFileIds) {
+  const payload = [text || "", ...(photoFileIds || [])].join("|");
   return crypto.createHash("sha256").update(payload).digest("hex");
 }
 
 // ------------------------------------------------------------
-// Process a complete album (or single message)
+// Process an album (group of photos)
 // ------------------------------------------------------------
 async function processAlbum(mediaGroupId, messages) {
+  console.log(`🔄 Processing album ${mediaGroupId} with ${messages.length} messages...`);
   try {
-    // Sort messages by date so we get the first one with caption
+    // Sort by date, use first as base
     const sorted = messages.sort((a, b) => a.date - b.date);
     const firstMsg = sorted[0];
 
-    // Extract caption from any message that has text
+    // Find a caption among messages
     let caption = "";
     for (const msg of sorted) {
       if (msg.text || msg.caption) {
@@ -153,7 +155,7 @@ async function processAlbum(mediaGroupId, messages) {
       }
     }
 
-    // Get all photo file IDs and URLs
+    // Collect all photo file IDs and generate URLs
     const photoFileIds = [];
     const photoUrls = [];
     for (const msg of sorted) {
@@ -167,10 +169,12 @@ async function processAlbum(mediaGroupId, messages) {
       }
     }
 
-    // Parse structured fields from the caption
+    console.log(`📸 Album ${mediaGroupId}: found ${photoFileIds.length} photos, caption length: ${caption.length}`);
+
+    // Parse structured data from caption
     const details = caption ? extractDetails(caption) : {};
 
-    // Build the post object
+    // Build post object
     const post = {
       chat_id: firstMsg.chat.id,
       chat_title: firstMsg.chat.title,
@@ -182,14 +186,12 @@ async function processAlbum(mediaGroupId, messages) {
       ...details,
     };
 
-    // Add video support if needed (not in album, but can be extended)
-
-    // Use first message_id as key (or composite)
+    // Save under a composite key based on media_group_id (or first message_id)
     const key = `album_${mediaGroupId}`;
     await db.ref(`telegram_posts/${key}`).set(post);
 
-    // Also store hash for deduplication (combine all photo IDs and caption)
-    const hash = computeContentHash(caption, photoFileIds, []);
+    // Deduplicate: store hash
+    const hash = computeContentHash(caption, photoFileIds);
     const hashRef = db.ref(`processed_hashes/${hash}`);
     await hashRef.set({
       first_seen: admin.database.ServerValue.TIMESTAMP,
@@ -200,6 +202,50 @@ async function processAlbum(mediaGroupId, messages) {
     console.log(`✅ Saved album ${mediaGroupId} with ${photoFileIds.length} photos`);
   } catch (err) {
     console.error(`❌ Error processing album ${mediaGroupId}:`, err);
+  }
+}
+
+// ------------------------------------------------------------
+// Process a single message (not part of album)
+// ------------------------------------------------------------
+async function processSingleMessage(msg) {
+  try {
+    const messageText = msg.text || msg.caption || "";
+    if (!messageText) {
+      console.log("⏩ Skipping: empty text/caption");
+      return;
+    }
+
+    const details = extractDetails(messageText);
+    const post = {
+      message_id: msg.message_id,
+      chat_id: msg.chat.id,
+      chat_title: msg.chat.title,
+      text: messageText,
+      date: msg.date,
+      ...details,
+    };
+
+    if (msg.photo) {
+      const largest = msg.photo[msg.photo.length - 1];
+      post.photo_file_id = largest.file_id;
+      if (BOT_TOKEN) {
+        const url = await getTelegramFileUrl(largest.file_id);
+        if (url) post.photo_url = url;
+      }
+    }
+    if (msg.video) {
+      post.video_file_id = msg.video.file_id;
+      if (BOT_TOKEN) {
+        const url = await getTelegramFileUrl(msg.video.file_id);
+        if (url) post.video_url = url;
+      }
+    }
+
+    await db.ref(`telegram_posts/${msg.message_id}`).set(post);
+    console.log(`✅ Saved single post ${msg.message_id}`);
+  } catch (err) {
+    console.error(`❌ Error processing single message ${msg.message_id}:`, err);
   }
 }
 
@@ -215,73 +261,41 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // If message has text but no media, process immediately (single post)
-    if (!msg.photo && !msg.video) {
-      // ... (existing single‑message handling) ...
-      // We'll keep it simple: just process normally (not album)
-      // But for brevity, I'll assume all messages with photos are handled via album logic if they have media_group_id.
-    }
-
-    // Check if this is part of an album
+    // If there is a media_group_id, buffer it
     if (msg.media_group_id) {
       const groupId = msg.media_group_id;
       if (!pendingAlbums.has(groupId)) {
-        // Start a new buffer
         pendingAlbums.set(groupId, { messages: [], timer: null });
       }
       const entry = pendingAlbums.get(groupId);
       entry.messages.push(msg);
 
-      // Clear existing timer if any
+      // Clear existing timer
       if (entry.timer) clearTimeout(entry.timer);
 
-      // Set a 2‑second timer to process the album
-      entry.timer = setTimeout(async () => {
+      // Set a new timer to process after 3 seconds (give time for all photos)
+      entry.timer = setTimeout(() => {
+        console.log(`⏰ Timer fired for album ${groupId}`);
         const albumData = pendingAlbums.get(groupId);
         if (albumData) {
-          await processAlbum(groupId, albumData.messages);
-          pendingAlbums.delete(groupId);
+          // Process album
+          processAlbum(groupId, albumData.messages).then(() => {
+            pendingAlbums.delete(groupId);
+            console.log(`🧹 Album ${groupId} removed from buffer`);
+          }).catch(err => {
+            console.error(`❌ Timer processing error for album ${groupId}:`, err);
+          });
+        } else {
+          console.warn(`⚠️ Album ${groupId} not found in buffer when timer fired.`);
         }
-      }, 2000);
+      }, 3000); // increased to 3 seconds
 
       console.log(`📸 Buffering album ${groupId} (${entry.messages.length} photos so far)`);
       return res.sendStatus(200);
     }
 
-    // --- Single photo/video (not part of an album) ---
-    // Handle as before (existing code)
-    const messageText = msg.text || msg.caption || "";
-    if (!messageText) {
-      console.log("⏩ Skipping: empty text/caption");
-      return res.sendStatus(200);
-    }
-
-    // ... (rest of the original single‑message logic)
-    // I'll compress for brevity – but you can reuse your earlier single‑message code here.
-    // In practice, you'd have a function to process single messages.
-    // For this solution, I'm providing the album fix; you can integrate with your existing code.
-
-    // For completeness, let's quickly handle single:
-    const details = extractDetails(messageText);
-    const post = {
-      message_id: msg.message_id,
-      chat_id: msg.chat.id,
-      chat_title: msg.chat.title,
-      text: messageText,
-      date: msg.date,
-      ...details,
-    };
-    if (msg.photo) {
-      const largest = msg.photo[msg.photo.length - 1];
-      post.photo_file_id = largest.file_id;
-      if (BOT_TOKEN) {
-        const url = await getTelegramFileUrl(largest.file_id);
-        if (url) post.photo_url = url;
-      }
-    }
-    // Save single
-    await db.ref(`telegram_posts/${msg.message_id}`).set(post);
-    console.log(`✅ Saved single post ${msg.message_id}`);
+    // Not an album: process single message immediately
+    await processSingleMessage(msg);
     res.sendStatus(200);
 
   } catch (err) {
