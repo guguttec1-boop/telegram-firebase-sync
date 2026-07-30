@@ -2,32 +2,46 @@ const express = require("express");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
 
-// For Node < 18, install node-fetch; for Node 18+, remove this require.
+// For Node < 18, install node-fetch; for Node 18+, you can remove this require.
 const fetch = require("node-fetch");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// Validate environment
+// ------------------------------------------------------------
+// Validate environment variables
+// ------------------------------------------------------------
 if (!process.env.FIREBASE_KEY || !process.env.FIREBASE_URL) {
-  console.error("Missing FIREBASE_KEY or FIREBASE_URL");
+  console.error("❌ Missing FIREBASE_KEY or FIREBASE_URL");
   process.exit(1);
 }
 
+// ------------------------------------------------------------
+// Initialize Firebase
+// ------------------------------------------------------------
 admin.initializeApp({
   credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_KEY)),
   databaseURL: process.env.FIREBASE_URL,
 });
 const db = admin.database();
 
+// ------------------------------------------------------------
+// Telegram Bot token (required for file URLs)
+// ------------------------------------------------------------
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-if (!BOT_TOKEN) console.warn("⚠️ TELEGRAM_BOT_TOKEN not set – file URLs will NOT be generated.");
-
-// --- Album buffer ---
-const pendingAlbums = new Map();
+if (!BOT_TOKEN) {
+  console.warn("⚠️ TELEGRAM_BOT_TOKEN not set – file URLs will NOT be generated.");
+} else {
+  console.log("✅ TELEGRAM_BOT_TOKEN is set.");
+}
 
 // ------------------------------------------------------------
-// Helper: clean keys, extract price, get file URL
+// Album buffer (in‑memory)
+// ------------------------------------------------------------
+const pendingAlbums = new Map(); // key: media_group_id, value: { messages: [], timer: null }
+
+// ------------------------------------------------------------
+// Helpers
 // ------------------------------------------------------------
 function cleanKey(str) {
   let cleaned = str.replace(/[\u{1F000}-\u{1FFFF}]/gu, "").trim();
@@ -42,17 +56,31 @@ function extractPrice(raw) {
 }
 
 async function getTelegramFileUrl(fileId) {
-  if (!BOT_TOKEN) return null;
+  if (!BOT_TOKEN) {
+    console.log("⏩ getTelegramFileUrl: BOT_TOKEN missing, returning null");
+    return null;
+  }
+
   try {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`;
+    console.log(`🔍 Fetching file URL for file_id: ${fileId}`);
     const response = await fetch(url);
     const data = await response.json();
+
     if (!data.ok) {
       console.error(`❌ Telegram API error for getFile: ${data.description}`);
       return null;
     }
-    if (!data.result || !data.result.file_path) return null;
-    return `https://api.telegram.org/file/bot${BOT_TOKEN}/${data.result.file_path}`;
+
+    if (!data.result || !data.result.file_path) {
+      console.error("❌ No file_path in Telegram response:", data);
+      return null;
+    }
+
+    const filePath = data.result.file_path;
+    const fullUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+    console.log(`✅ Generated file URL: ${fullUrl}`);
+    return fullUrl;
   } catch (err) {
     console.error(`❌ Exception in getTelegramFileUrl: ${err.message}`);
     return null;
@@ -70,6 +98,7 @@ function extractDetails(text) {
     telegram: "", memory: "", storage: "", location: "", website: "",
     phone: "", status: ""
   };
+
   const fieldMap = {
     name: "name", category: "category", brand: "brand", type: "type",
     price: "price", condition: "condition", processor: "processor",
@@ -89,6 +118,7 @@ function extractDetails(text) {
   for (const rawLine of lines) {
     const trimmed = rawLine.trim();
     if (!trimmed) continue;
+
     const separator = trimmed.indexOf(":");
     let isField = false, key = null, value = "";
     if (separator !== -1) {
@@ -101,6 +131,7 @@ function extractDetails(text) {
         value = possibleValue;
       }
     }
+
     if (isField) {
       if (currentField) {
         data[currentField] = currentValue.join("\n").trim();
@@ -142,11 +173,10 @@ function computeContentHash(text, photoFileIds) {
 async function processAlbum(mediaGroupId, messages) {
   console.log(`🔄 Processing album ${mediaGroupId} with ${messages.length} messages...`);
   try {
-    // Sort by date, use first as base
     const sorted = messages.sort((a, b) => a.date - b.date);
     const firstMsg = sorted[0];
 
-    // Find a caption among messages
+    // Find caption
     let caption = "";
     for (const msg of sorted) {
       if (msg.text || msg.caption) {
@@ -155,26 +185,33 @@ async function processAlbum(mediaGroupId, messages) {
       }
     }
 
-    // Collect all photo file IDs and generate URLs
+    console.log(`📸 Album ${mediaGroupId}: BOT_TOKEN present? ${!!BOT_TOKEN}`);
+
     const photoFileIds = [];
     const photoUrls = [];
     for (const msg of sorted) {
       if (msg.photo) {
         const largest = msg.photo[msg.photo.length - 1];
-        photoFileIds.push(largest.file_id);
+        const fileId = largest.file_id;
+        photoFileIds.push(fileId);
+        console.log(`🔍 Processing photo with file_id: ${fileId}`);
         if (BOT_TOKEN) {
-          const url = await getTelegramFileUrl(largest.file_id);
-          if (url) photoUrls.push(url);
+          const url = await getTelegramFileUrl(fileId);
+          if (url) {
+            photoUrls.push(url);
+            console.log(`✅ Got URL: ${url}`);
+          } else {
+            console.warn(`⚠️ No URL for file_id: ${fileId}`);
+          }
+        } else {
+          console.warn(`⏩ BOT_TOKEN missing – skipping URL generation for ${fileId}`);
         }
       }
     }
 
-    console.log(`📸 Album ${mediaGroupId}: found ${photoFileIds.length} photos, caption length: ${caption.length}`);
+    console.log(`📸 Album ${mediaGroupId}: found ${photoFileIds.length} photos, URLs: ${photoUrls.length}`);
 
-    // Parse structured data from caption
     const details = caption ? extractDetails(caption) : {};
-
-    // Build post object
     const post = {
       chat_id: firstMsg.chat.id,
       chat_title: firstMsg.chat.title,
@@ -186,20 +223,19 @@ async function processAlbum(mediaGroupId, messages) {
       ...details,
     };
 
-    // Save under a composite key based on media_group_id (or first message_id)
+    // Save under "album_<media_group_id>"
     const key = `album_${mediaGroupId}`;
     await db.ref(`telegram_posts/${key}`).set(post);
 
-    // Deduplicate: store hash
+    // Deduplicate
     const hash = computeContentHash(caption, photoFileIds);
-    const hashRef = db.ref(`processed_hashes/${hash}`);
-    await hashRef.set({
+    await db.ref(`processed_hashes/${hash}`).set({
       first_seen: admin.database.ServerValue.TIMESTAMP,
       media_group_id: mediaGroupId,
       chat_id: firstMsg.chat.id,
     });
 
-    console.log(`✅ Saved album ${mediaGroupId} with ${photoFileIds.length} photos`);
+    console.log(`✅ Saved album ${mediaGroupId} with ${photoFileIds.length} photos and ${photoUrls.length} URLs`);
   } catch (err) {
     console.error(`❌ Error processing album ${mediaGroupId}:`, err);
   }
@@ -228,17 +264,36 @@ async function processSingleMessage(msg) {
 
     if (msg.photo) {
       const largest = msg.photo[msg.photo.length - 1];
-      post.photo_file_id = largest.file_id;
+      const fileId = largest.file_id;
+      post.photo_file_id = fileId;
+      console.log(`📸 Single photo file_id: ${fileId}`);
       if (BOT_TOKEN) {
-        const url = await getTelegramFileUrl(largest.file_id);
-        if (url) post.photo_url = url;
+        const url = await getTelegramFileUrl(fileId);
+        if (url) {
+          post.photo_url = url;
+          console.log(`✅ Added photo_url: ${url}`);
+        } else {
+          console.warn(`⚠️ Could not generate photo URL for file_id: ${fileId}`);
+        }
+      } else {
+        console.warn("⚠️ BOT_TOKEN missing – skipping photo URL generation.");
       }
     }
+
     if (msg.video) {
-      post.video_file_id = msg.video.file_id;
+      const fileId = msg.video.file_id;
+      post.video_file_id = fileId;
+      console.log(`🎬 Single video file_id: ${fileId}`);
       if (BOT_TOKEN) {
-        const url = await getTelegramFileUrl(msg.video.file_id);
-        if (url) post.video_url = url;
+        const url = await getTelegramFileUrl(fileId);
+        if (url) {
+          post.video_url = url;
+          console.log(`✅ Added video_url: ${url}`);
+        } else {
+          console.warn(`⚠️ Could not generate video URL for file_id: ${fileId}`);
+        }
+      } else {
+        console.warn("⚠️ BOT_TOKEN missing – skipping video URL generation.");
       }
     }
 
@@ -288,7 +343,7 @@ app.post("/webhook", async (req, res) => {
         } else {
           console.warn(`⚠️ Album ${groupId} not found in buffer when timer fired.`);
         }
-      }, 3000); // increased to 3 seconds
+      }, 3000);
 
       console.log(`📸 Buffering album ${groupId} (${entry.messages.length} photos so far)`);
       return res.sendStatus(200);
@@ -305,8 +360,16 @@ app.post("/webhook", async (req, res) => {
 });
 
 // ------------------------------------------------------------
-// Health check & start
+// Health check
 // ------------------------------------------------------------
-app.get("/", (req, res) => res.send("Telegram Firebase Sync Running ✅"));
+app.get("/", (req, res) => {
+  res.send("Telegram Firebase Sync Running ✅");
+});
+
+// ------------------------------------------------------------
+// Start server
+// ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server started on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server started on port ${PORT}`);
+});
