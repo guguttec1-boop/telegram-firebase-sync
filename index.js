@@ -30,7 +30,7 @@ const db = admin.database();
 // ------------------------------------------------------------
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!BOT_TOKEN) {
-  console.warn("⚠️ TELEGRAM_BOT_TOKEN not set – file URLs will NOT be generated.");
+  console.warn("⚠️ TELEGRAM_BOT_TOKEN not set – file URLs will NOT be generated or refreshed.");
 } else {
   console.log("✅ TELEGRAM_BOT_TOKEN is set.");
 }
@@ -168,6 +168,109 @@ function computeContentHash(text, photoFileIds, videoFileIds) {
 }
 
 // ------------------------------------------------------------
+// Refresh all temporary URLs every 12 hours
+// ------------------------------------------------------------
+async function refreshAllUrls() {
+  if (!BOT_TOKEN) {
+    console.log("⏩ URL refresh skipped – BOT_TOKEN not set.");
+    return;
+  }
+
+  console.log("🔄 Starting URL refresh cycle (every 12 hours)...");
+
+  try {
+    // Get all posts from telegram_posts
+    const snapshot = await db.ref("telegram_posts").once("value");
+    if (!snapshot.exists()) {
+      console.log("ℹ️ No posts found to refresh.");
+      return;
+    }
+
+    const updates = {};
+    const posts = snapshot.val();
+    let count = 0;
+
+    for (const [key, post] of Object.entries(posts)) {
+      let needsUpdate = false;
+      const updatedPost = { ...post };
+
+      // Single photo
+      if (post.photo_file_id && !post.photo_url) {
+        const newUrl = await getTelegramFileUrl(post.photo_file_id);
+        if (newUrl) {
+          updatedPost.photo_url = newUrl;
+          needsUpdate = true;
+        }
+      }
+
+      // Single video
+      if (post.video_file_id && !post.video_url) {
+        const newUrl = await getTelegramFileUrl(post.video_file_id);
+        if (newUrl) {
+          updatedPost.video_url = newUrl;
+          needsUpdate = true;
+        }
+      }
+
+      // Album photos (array)
+      if (post.photo_file_ids && Array.isArray(post.photo_file_ids)) {
+        const newUrls = [];
+        let allGood = true;
+        for (const fileId of post.photo_file_ids) {
+          const url = await getTelegramFileUrl(fileId);
+          if (url) {
+            newUrls.push(url);
+          } else {
+            allGood = false;
+            break;
+          }
+        }
+        if (allGood && newUrls.length > 0) {
+          updatedPost.photo_urls = newUrls;
+          needsUpdate = true;
+        }
+      }
+
+      // Album videos (array)
+      if (post.video_file_ids && Array.isArray(post.video_file_ids)) {
+        const newUrls = [];
+        let allGood = true;
+        for (const fileId of post.video_file_ids) {
+          const url = await getTelegramFileUrl(fileId);
+          if (url) {
+            newUrls.push(url);
+          } else {
+            allGood = false;
+            break;
+          }
+        }
+        if (allGood && newUrls.length > 0) {
+          updatedPost.video_urls = newUrls;
+          needsUpdate = true;
+        }
+      }
+
+      if (needsUpdate) {
+        updates[`telegram_posts/${key}`] = updatedPost;
+        count++;
+        // Avoid hitting rate limits – delay 100ms between updates
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+
+    if (count > 0) {
+      // Perform all updates in one batch
+      await db.ref().update(updates);
+      console.log(`✅ URL refresh complete: updated ${count} posts.`);
+    } else {
+      console.log("ℹ️ No URLs needed refreshing.");
+    }
+  } catch (err) {
+    console.error("❌ Error during URL refresh:", err);
+  }
+}
+
+// ------------------------------------------------------------
 // Process an album (photos and/or videos)
 // ------------------------------------------------------------
 async function processAlbum(mediaGroupId, messages) {
@@ -187,7 +290,6 @@ async function processAlbum(mediaGroupId, messages) {
 
     console.log(`📸 Album ${mediaGroupId}: BOT_TOKEN present? ${!!BOT_TOKEN}`);
 
-    // Arrays for photos and videos
     const photoFileIds = [];
     const photoUrls = [];
     const videoFileIds = [];
@@ -396,9 +498,16 @@ app.get("/", (req, res) => {
 });
 
 // ------------------------------------------------------------
-// Start server
+// Start server & schedule URL refresh
 // ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🚀 Server started on port ${PORT}`);
+
+  // Run initial refresh (optional, but good to have fresh URLs)
+  await refreshAllUrls();
+
+  // Schedule refresh every 12 hours (43200000 ms)
+  setInterval(refreshAllUrls, 12 * 60 * 60 * 1000);
+  console.log("⏰ Scheduled URL refresh every 12 hours.");
 });
