@@ -168,7 +168,7 @@ function computeContentHash(text, photoFileIds, videoFileIds) {
 }
 
 // ------------------------------------------------------------
-// Refresh ALL URLs every 12 hours (even if they already exist)
+// Refresh ALL URLs (regenerate for every file_id)
 // ------------------------------------------------------------
 async function refreshAllUrls() {
   if (!BOT_TOKEN) {
@@ -176,10 +176,9 @@ async function refreshAllUrls() {
     return;
   }
 
-  console.log("🔄 Starting full URL refresh cycle (every 12 hours)...");
+  console.log("🔄 Starting full URL refresh ...");
 
   try {
-    // Get all posts from telegram_posts
     const snapshot = await db.ref("telegram_posts").once("value");
     if (!snapshot.exists()) {
       console.log("ℹ️ No posts found to refresh.");
@@ -204,7 +203,6 @@ async function refreshAllUrls() {
         } else {
           console.warn(`⚠️ Could not refresh photo URL for post ${key}, keeping old.`);
         }
-        // small delay
         await new Promise(resolve => setTimeout(resolve, 100));
       }
 
@@ -276,7 +274,6 @@ async function refreshAllUrls() {
     }
 
     if (totalUpdated > 0) {
-      // Batch update
       await db.ref().update(updates);
       console.log(`✅ URL refresh complete: updated ${totalUpdated} posts.`);
     } else {
@@ -284,6 +281,61 @@ async function refreshAllUrls() {
     }
   } catch (err) {
     console.error("❌ Error during URL refresh:", err);
+    throw err; // rethrow so the caller can handle
+  }
+}
+
+// ------------------------------------------------------------
+// Check regeneration flag and run if needed
+// ------------------------------------------------------------
+let isRegenerating = false;
+
+async function checkAndRunRegeneration() {
+  // Prevent overlapping runs
+  if (isRegenerating) {
+    console.log("⏳ Regeneration already in progress, skipping check.");
+    return;
+  }
+
+  try {
+    const snap = await db.ref("media_regeneration").once("value");
+    if (!snap.exists()) {
+      console.log("ℹ️ No media_regeneration node found, skipping.");
+      return;
+    }
+
+    const data = snap.val();
+    if (data.status === "yes") {
+      console.log("🚀 Regeneration flag is 'yes'. Starting URL regeneration...");
+      isRegenerating = true;
+
+      try {
+        await refreshAllUrls();
+
+        // After successful regeneration, set status to "done"
+        const code = data.code || "";
+        await db.ref("media_regeneration").set({
+          status: "done",
+          code: code,
+        });
+        console.log("✅ Regeneration completed. Flag set to 'done'.");
+      } catch (err) {
+        console.error("❌ Regeneration failed:", err);
+        // Optionally set status to 'error' or leave as 'yes' to retry later?
+        // For now, we'll set to 'done' to avoid endless retries, but you can change.
+        // We'll set to 'done' to indicate it was attempted.
+        await db.ref("media_regeneration").update({
+          status: "done",
+        });
+        console.log("⚠️ Regeneration attempted with errors, flag set to 'done'.");
+      } finally {
+        isRegenerating = false;
+      }
+    } else {
+      console.log(`ℹ️ media_regeneration status is '${data.status}', no action.`);
+    }
+  } catch (err) {
+    console.error("❌ Error checking media_regeneration node:", err);
   }
 }
 
@@ -502,16 +554,16 @@ app.get("/", (req, res) => {
 });
 
 // ------------------------------------------------------------
-// Start server & schedule URL refresh
+// Start server & set up regeneration checks
 // ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`🚀 Server started on port ${PORT}`);
 
-  // Run initial full refresh on startup
-  await refreshAllUrls();
+  // Check regeneration flag immediately on startup
+  await checkAndRunRegeneration();
 
-  // Schedule refresh every 12 hours
-  setInterval(refreshAllUrls, 12 * 60 * 60 * 1000);
-  console.log("⏰ Scheduled URL refresh every 12 hours.");
+  // Then check every 5 minutes (adjust as needed)
+  setInterval(checkAndRunRegeneration, 5 * 60 * 1000);
+  console.log("⏰ Scheduled regeneration flag check every 5 minutes.");
 });
